@@ -12,25 +12,31 @@ def _():
     import sys
     import random
 
-    # Use a silent approach for dependencies
-    def install_deps():
-        # Only try to install if explicitly missing
-        # In this specific environment, we will ignore pip errors
-        deps = ["numpy", "rasterio", "pillow", "polars", "leafmap", "localtileserver"]
-        for dep in deps:
-            try:
-                if dep == "pillow":
-                    __import__("PIL")
-                else:
-                    __import__(dep)
-            except ImportError:
-                try:
-                    # Try calling pip but don't crash if it fails (e.g. no pip in venv)
-                    subprocess.run([sys.executable, "-m", "pip", "install", dep], capture_output=True)
-                except:
-                    pass
+    # All third-party dependencies in one place
+    _deps = {
+        "numpy": "numpy",
+        "PIL": "pillow",
+        "polars": "polars",
+        "rasterio": "rasterio",
+        "leafmap": "leafmap",
+        "localtileserver": "localtileserver",
+        "plotly": "plotly",
+        "cv2": "opencv-python",
+        "easyocr": "easyocr",
+        "scipy": "scipy",
+    }
 
-    install_deps()
+    for _import_name, _pip_name in _deps.items():
+        try:
+            __import__(_import_name)
+        except ImportError:
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", _pip_name],
+                    capture_output=True,
+                )
+            except Exception:
+                pass
 
     import numpy as np
     from PIL import Image
@@ -38,20 +44,27 @@ def _():
     import rasterio
     from rasterio.enums import Resampling
     import leafmap
-
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+    import cv2
+    import easyocr
 
     return (
         Image,
         Resampling,
+        cv2,
+        easyocr,
+        go,
         leafmap,
+        make_subplots,
         mo,
         np,
         os,
         pl,
+        px,
         random,
         rasterio,
-        subprocess,
-        sys,
     )
 
 
@@ -219,47 +232,8 @@ def _(downsample_tiff, leafmap, mo, os, rasterio, tiffs_to_show):
 
 
 @app.cell
-def _(mo):
-    readme_content = """# GeoTIFF Map Reader
-
-    This repository contains a Marimo notebook (`MapReader.py`) designed to explore, audit, and visualize a collection of GeoTIFF files.
-
-    ## Features
-
-    1. **Random Sampling and Previewing:** Selects random TIFF files from directories and downsamples them for a quick visual preview.
-    2. **Geospatial Audit:** Extracts metadata from the TIFFs (such as Dimensions, Bands, Color Space, Data Type, and Coordinate Reference System) and displays the results in a Polars DataFrame.
-    3. **Interactive Mapping:** Plots the rasters on interactive maps using `leafmap`, handling CRS transformations so the images are correctly placed on basemaps.
-
-    ## Dependencies
-
-    The notebook automatically attempts to install necessary dependencies, including:
-    - `numpy`
-    - `pillow`
-    - `polars`
-    - `rasterio`
-    - `leafmap`
-
-    ## Usage
-
-    Run the notebook using Marimo:
-    ```bash
-    marimo edit MapReader.py
-    ```
-    """
-
-    with open("README.md", "w") as f:
-        f.write(readme_content)
-
-    mo.md("Successfully created README.md")
-    return
-
-
-@app.cell
-def _(downsample_tiff, mo, tiffs_to_show):
-    import plotly.express as px
-    from plotly.subplots import make_subplots
-    import plotly.graph_objects as go
-
+def _(downsample_tiff, make_subplots, mo, px, tiffs_to_show):
+    # preview current maps
     _fig = make_subplots(rows=1, cols=len(tiffs_to_show), subplot_titles=list(tiffs_to_show.keys()))
 
     for _idx, (_label, _path) in enumerate(tiffs_to_show.items()):
@@ -272,120 +246,317 @@ def _(downsample_tiff, mo, tiffs_to_show):
     _fig.update_yaxes(showticklabels=False)
 
     mo.ui.plotly(_fig)
-    return go, make_subplots, px
+    return
 
 
 @app.cell
-def _(downsample_tiff, go, make_subplots, mo, np, px, tiffs_to_show):
-    import cv2
+def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_show):
+    from scipy.ndimage import map_coordinates
+    from scipy.signal import find_peaks
+    from rasterio.warp import transform_bounds, transform
+    from rasterio.transform import rowcol
 
-    _grid_fig = make_subplots(rows=len(tiffs_to_show), cols=1, subplot_titles=[f"Grid: {k}" for k in tiffs_to_show.keys()])
+    # --- Helper functions ---
+
+    def _detect_neatline(gray_img):
+        """Find the map's inner boundary to exclude collar/margins."""
+        h, w = gray_img.shape
+        row_means = gray_img.mean(axis=1)
+        col_means = gray_img.mean(axis=0)
+
+        def _find_edge(profile, length):
+            """Find strongest gradient in each half of a 1-D intensity profile."""
+            grad = np.abs(np.diff(profile.astype(float)))
+            mid = length // 2
+            lo = int(np.argmax(grad[:mid])) if grad[:mid].max() > 10 else int(length * 0.05)
+            hi_region = grad[mid:]
+            hi = mid + int(np.argmax(hi_region)) if hi_region.max() > 10 else int(length * 0.95)
+            return lo, hi
+
+        row_min, row_max = _find_edge(row_means, h)
+        col_min, col_max = _find_edge(col_means, w)
+        return row_min, row_max, col_min, col_max
+
+    def _generate_crs_candidates(path, analysis_scale):
+        """Generate candidate graticule lines at standard cartographic intervals."""
+        try:
+            with rasterio.open(path) as src:
+                if not src.crs:
+                    return None
+                wgs_bounds = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+                lon_min, lat_min, lon_max, lat_max = wgs_bounds
+                lon_span = lon_max - lon_min
+                lat_span = lat_max - lat_min
+
+                full_transform = src.transform
+                map_crs = src.crs
+                full_h, full_w = src.height, src.width
+        except Exception:
+            return None
+
+        intervals = [10, 5, 2, 1, 0.5, 1/4, 1/6, 1/12]
+        candidates = []
+
+        for interval in intervals:
+            n_meridians = int(lon_span / interval) - 1
+            n_parallels = int(lat_span / interval) - 1
+            total = n_meridians + n_parallels
+            if total < 2 or total > 50:
+                continue
+
+            meridian_curves = []
+            first_lon = np.ceil(lon_min / interval) * interval
+            for i in range(n_meridians):
+                lon = first_lon + i * interval
+                if lon <= lon_min or lon >= lon_max:
+                    continue
+                lats = np.linspace(lat_min, lat_max, 100)
+                lons = np.full_like(lats, lon)
+                try:
+                    xs, ys = transform("EPSG:4326", map_crs, lons, lats)
+                    rows, cols = rowcol(full_transform, xs, ys)
+                    rows = np.array(rows, dtype=float) * analysis_scale
+                    cols = np.array(cols, dtype=float) * analysis_scale
+                    meridian_curves.append((rows, cols))
+                except Exception:
+                    continue
+
+            parallel_curves = []
+            first_lat = np.ceil(lat_min / interval) * interval
+            for i in range(n_parallels):
+                lat = first_lat + i * interval
+                if lat <= lat_min or lat >= lat_max:
+                    continue
+                lons = np.linspace(lon_min, lon_max, 100)
+                lats = np.full_like(lons, lat)
+                try:
+                    xs, ys = transform("EPSG:4326", map_crs, lons, lats)
+                    rows, cols = rowcol(full_transform, xs, ys)
+                    rows = np.array(rows, dtype=float) * analysis_scale
+                    cols = np.array(cols, dtype=float) * analysis_scale
+                    parallel_curves.append((rows, cols))
+                except Exception:
+                    continue
+
+            if meridian_curves or parallel_curves:
+                candidates.append((interval, meridian_curves, parallel_curves))
+
+        return candidates if candidates else None
+
+    def _score_candidate(edge_img, neatline, meridians, parallels):
+        """Score how well a candidate interval matches actual image edges."""
+        row_min, row_max, col_min, col_max = neatline
+        h, w = edge_img.shape
+        total_hits = 0
+        total_samples = 0
+
+        all_curves = list(meridians) + list(parallels)
+        if not all_curves:
+            return 0.0
+
+        for rows, cols in all_curves:
+            for offset in [-2, -1, 0, 1, 2]:
+                # For meridians (vertical), offset applies to cols; for parallels, to rows
+                sample_rows = np.clip(rows + offset * 0.5, 0, h - 1)
+                sample_cols = np.clip(cols + offset * 0.5, 0, w - 1)
+                # Only sample within neatline
+                mask = (sample_rows >= row_min) & (sample_rows <= row_max) & \
+                       (sample_cols >= col_min) & (sample_cols <= col_max)
+                if mask.sum() == 0:
+                    continue
+                vals = map_coordinates(edge_img, [sample_rows[mask], sample_cols[mask]], order=0)
+                total_hits += (vals > 0).sum()
+                total_samples += mask.sum()
+
+        if total_samples == 0:
+            return 0.0
+
+        edge_density = total_hits / total_samples
+        n_lines = len(all_curves)
+        coverage = min(1.0, n_lines / 4.0)
+        return edge_density * coverage
+
+    def _detect_graticule_pixel_space(gray_img, edge_img, neatline):
+        """Fallback for ungeoreferenced TIFFs — find regular spacing via FFT."""
+        row_min, row_max, col_min, col_max = neatline
+        cropped = edge_img[row_min:row_max, col_min:col_max]
+        if cropped.size == 0:
+            return [], []
+
+        # Project edges onto row and column axes
+        row_profile = cropped.mean(axis=1).astype(float)
+        col_profile = cropped.mean(axis=0).astype(float)
+
+        def _find_spacing(profile):
+            if len(profile) < 8:
+                return []
+            # FFT to find dominant periodic spacing
+            fft_vals = np.abs(np.fft.rfft(profile - profile.mean()))
+            # Ignore DC and very low frequencies (spacing > half the profile)
+            fft_vals[:2] = 0
+            dominant_freq_idx = np.argmax(fft_vals)
+            if dominant_freq_idx == 0:
+                return []
+            spacing = len(profile) / dominant_freq_idx
+
+            if spacing < 10 or spacing > len(profile) / 2:
+                return []
+
+            # Find actual peaks at roughly this spacing
+            min_dist = int(spacing * 0.5)
+            peaks, _ = find_peaks(profile, distance=max(1, min_dist), height=profile.mean())
+
+            if len(peaks) < 2:
+                return []
+
+            # Validate regularity: reject peaks deviating >30% from median spacing
+            diffs = np.diff(peaks)
+            if len(diffs) == 0:
+                return []
+            median_sp = np.median(diffs)
+            if median_sp == 0:
+                return []
+            regular = np.abs(diffs - median_sp) / median_sp < 0.3
+            # Keep only peaks connected by regular intervals
+            valid = [peaks[0]]
+            for i, is_reg in enumerate(regular):
+                if is_reg:
+                    valid.append(peaks[i + 1])
+            return valid
+
+        h_positions = _find_spacing(row_profile)
+        v_positions = _find_spacing(col_profile)
+
+        # Convert from cropped coords back to full image coords
+        h_positions = [p + row_min for p in h_positions]
+        v_positions = [p + col_min for p in v_positions]
+        return h_positions, v_positions
+
+    def _format_interval(deg):
+        """Format degree value as human-readable string."""
+        minutes = deg * 60
+        if abs(deg - round(deg)) < 1e-6 and deg >= 1:
+            return f"{int(round(deg))}\u00b0"
+        if abs(minutes - round(minutes)) < 0.1:
+            return f"{int(round(minutes))}'"
+        return f"{deg:.4f}\u00b0"
+
+    # --- Main loop ---
+    _analysis_scale = 0.15
+    _display_scale = 0.05
+    _grid_fig = make_subplots(
+        rows=len(tiffs_to_show), cols=1,
+        subplot_titles=[f"Grid: {k}" for k in tiffs_to_show.keys()]
+    )
+    _summaries = []
 
     for _idx, (_label, _path) in enumerate(tiffs_to_show.items()):
-        # Get downsampled image for display
-        _display_scale = 0.05
-        _img_pil_display = downsample_tiff(_path, scale_factor=_display_scale)
-        _img_np_display = np.array(_img_pil_display)
+        # Load at analysis and display scales
+        _img_analysis = np.array(downsample_tiff(_path, scale_factor=_analysis_scale))
+        _img_display = np.array(downsample_tiff(_path, scale_factor=_display_scale))
 
-        # High res for vision
-        _vision_scale = 1.0
-        _img_pil_vision = downsample_tiff(_path, scale_factor=_vision_scale)
-        _img_np_vision = np.array(_img_pil_vision)
-
-        # Convert to grayscale
-        if len(_img_np_vision.shape) == 3:
-            _gray = cv2.cvtColor(_img_np_vision, cv2.COLOR_RGB2GRAY)
+        # Grayscale + Canny
+        if len(_img_analysis.shape) == 3:
+            _gray = cv2.cvtColor(_img_analysis, cv2.COLOR_RGB2GRAY)
         else:
-            _gray = _img_np_vision
-
-        # Edge detection on full/high resolution
+            _gray = _img_analysis
         _edges = cv2.Canny(_gray, 50, 150, apertureSize=3)
 
-        # Line detection on full/high resolution
-        _lines = cv2.HoughLinesP(_edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
+        # Detect neatline
+        _neatline = _detect_neatline(_gray)
 
-        # Extract horizontal and vertical coordinates
-        _h_lines_y = []
-        _v_lines_x = []
+        # Try CRS-aware path
+        _method = None
+        _interval_str = "N/A"
+        _draw_curves = []
+        _line_color = "cyan"
+        _h_count = 0
+        _v_count = 0
 
-        if _lines is not None:
-            for _line in _lines:
-                x1, y1, x2, y2 = _line[0]
-                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
-                if angle < 5 or angle > 175:
-                    # horizontal
-                    _h_lines_y.append((y1 + y2) / 2)
-                elif 85 < angle < 95:
-                    # vertical
-                    _v_lines_x.append((x1 + x2) / 2)
+        _candidates = _generate_crs_candidates(_path, _analysis_scale)
+        if _candidates:
+            _best_score = 0.0
+            _best = None
+            for _interval, _meridians, _parallels in _candidates:
+                _s = _score_candidate(_edges, _neatline, _meridians, _parallels)
+                if _s > _best_score:
+                    _best_score = _s
+                    _best = (_interval, _meridians, _parallels)
 
-        def get_dominant_lines(coords, max_dim, max_lines=100):
-            if not coords:
-                return []
-            bins = min(max_lines * 5, max(10, max_dim // 10))
-            hist, bin_edges = np.histogram(coords, bins=bins)
+            if _best is not None and _best_score > 0.02:
+                _method = "CRS-aware"
+                _interval_str = _format_interval(_best[0])
+                _line_color = "cyan"
+                # Collect curves for drawing (meridians + parallels)
+                for rows, cols in _best[1]:
+                    _draw_curves.append((rows, cols))
+                    _v_count += 1
+                for rows, cols in _best[2]:
+                    _draw_curves.append((rows, cols))
+                    _h_count += 1
 
-            # Find local maxima to avoid clustering multiple lines too closely
-            peaks = []
-            for i in range(1, len(hist)-1):
-                if hist[i] > hist[i-1] and hist[i] >= hist[i+1] and hist[i] > max(1, len(coords)*0.01):
-                    peaks.append((hist[i], (bin_edges[i] + bin_edges[i+1])/2))
+        # Pixel-space fallback
+        if _method is None:
+            _h_positions, _v_positions = _detect_graticule_pixel_space(_gray, _edges, _neatline)
+            _method = "Pixel-space (FFT)"
+            _line_color = "red"
+            _h_count = len(_h_positions)
+            _v_count = len(_v_positions)
+            # Convert to curves for uniform drawing
+            a_h, a_w = _gray.shape
+            for y in _h_positions:
+                _draw_curves.append(
+                    (np.array([y, y], dtype=float), np.array([0, a_w - 1], dtype=float))
+                )
+            for x in _v_positions:
+                _draw_curves.append(
+                    (np.array([0, a_h - 1], dtype=float), np.array([x, x], dtype=float))
+                )
 
-            # Sort by count and limit to max_lines
-            peaks.sort(reverse=True, key=lambda p: p[0])
-            return sorted([p[1] for p in peaks[:max_lines]])
+        _summaries.append(
+            f"**{_label}**: {_method} | interval: {_interval_str} | "
+            f"{_h_count} parallels, {_v_count} meridians"
+        )
 
-        _dom_h = get_dominant_lines(_h_lines_y, _gray.shape[0])
-        _dom_v = get_dominant_lines(_v_lines_x, _gray.shape[1])
-
-        # Add display image trace
-        _img_trace = px.imshow(_img_np_display).data[0]
+        # --- Draw on plotly figure ---
+        _img_trace = px.imshow(_img_display).data[0]
         _grid_fig.add_trace(_img_trace, row=_idx + 1, col=1)
 
-        # Add line traces spanning the image
-        _scale_ratio = _display_scale / _vision_scale
+        _scale_ratio = _display_scale / _analysis_scale
         _line_x = []
         _line_y = []
-
-        width_scaled = _gray.shape[1] * _scale_ratio
-        height_scaled = _gray.shape[0] * _scale_ratio
-
-        for y in _dom_h:
-            ys = y * _scale_ratio
-            _line_x.extend([0, width_scaled, None])
-            _line_y.extend([ys, ys, None])
-
-        for x in _dom_v:
-            xs = x * _scale_ratio
-            _line_x.extend([xs, xs, None])
-            _line_y.extend([0, height_scaled, None])
+        for rows, cols in _draw_curves:
+            _line_x.extend((cols * _scale_ratio).tolist() + [None])
+            _line_y.extend((rows * _scale_ratio).tolist() + [None])
 
         if _line_x:
             _grid_fig.add_trace(
-                go.Scatter(x=_line_x, y=_line_y, mode='lines', line=dict(color='red', width=2), showlegend=False),
+                go.Scatter(
+                    x=_line_x, y=_line_y, mode='lines',
+                    line=dict(color=_line_color, width=2), showlegend=False
+                ),
                 row=_idx + 1, col=1
             )
 
-    _grid_fig.update_layout(height=400 * len(tiffs_to_show), title_text="Extracted Graticule Grids (Max 100 Divisions)")
+    _grid_fig.update_layout(
+        height=400 * len(tiffs_to_show),
+        title_text="CRS-Aware Graticule Detection"
+    )
     _grid_fig.update_xaxes(showticklabels=False)
     _grid_fig.update_yaxes(showticklabels=False)
 
     mo.vstack([
         mo.md("## Graticule Extraction"),
-        mo.md("Using Hough Transform and histogram peak detection to extract regular rectilinear grids (max 100 vertical/horizontal divisions)."),
+        mo.md("CRS-aware detection scores projected candidate grids against edge evidence. "
+               "Cyan lines = CRS-aware, Red lines = pixel-space FFT fallback."),
+        mo.md("\n\n".join(_summaries)),
         mo.ui.plotly(_grid_fig)
     ])
     return
 
 
 @app.cell
-def _(downsample_tiff, mo, np, pl, subprocess, sys, tiffs_to_show):
-    try:
-        import easyocr
-    except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "easyocr"], capture_output=True)
-        import easyocr
-
+def _(downsample_tiff, easyocr, mo, np, pl, tiffs_to_show):
     # Initialize the reader with English and Simplified Chinese
     _reader = easyocr.Reader(['en', 'ch_sim'])
 
