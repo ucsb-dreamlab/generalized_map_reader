@@ -1,20 +1,85 @@
-# Project Overview: Geographic Data Repository
+# GEMINI.md
 
-This directory serves as a repository for geographic raster data, primarily consisting of GeoTIFF images and their associated georeferencing and projection files. It is organized into subdirectories (`geotiffs`, `dumbtiffs`) to potentially categorize different sets of imagery or data types.
+This file provides guidance to Gemini when working with code in this repository.
 
-## Directory Structure and Contents
+## Project Overview
 
-*   **`geotiffs/`**: This directory contains GeoTIFF (`.tif`) image files along with their corresponding world files (`.tfw`) and projection files (`.prj`). These files are commonly used in Geographic Information Systems (GIS) for displaying and analyzing spatially referenced images.
-    *   **`.tif` (GeoTIFF):** Tagged Image File Format, an industry-standard raster image format that includes embedded georeferencing information.
-    *   **`.tfw` (World File):** A plain text file that specifies the location, scale, and rotation of a raster image. It allows GIS software to correctly position the image on a map.
-    *   **`.prj` (Projection File):** Contains information about the coordinate system and projection used by the GeoTIFF.
-*   **`dumbtiffs/`**: The purpose of this directory is currently unknown without further context, but its name suggests it might contain TIFF files without embedded georeferencing information, or perhaps simpler, non-georeferenced images.
+Geospatial AI Map Reader for UCSB DreamLab. Transforms scans of paper maps into structured, queryable data using machine vision and computational cartography. Built as interactive Marimo notebooks for exploring, auditing, and visualizing GeoTIFF collections.
 
-## Usage
+Serves as new implementations of [MapReader](https://mapreader.readthedocs.io/en/latest/) and [MapKurator](https://knowledge-computing.github.io/mapkurator-doc/#/docs/introduction).
 
-The files within this repository are intended for use with GIS software (e.g., QGIS, ArcGIS, GDAL utilities) for tasks suchs as:
+## Commands
 
-*   Viewing and displaying geographical maps and aerial imagery.
-*   Performing spatial analysis.
-*   Integrating with other geographic datasets.
-*   As source data for mapping applications.
+```bash
+# Run the main interactive notebook
+marimo edit MapReader.py
+
+# Run the simple file explorer
+python main.py
+```
+
+Dependencies are auto-installed at runtime in `MapReader.py` via pip fallback. Core deps: numpy, rasterio, pillow, polars, leafmap, localtileserver, easyocr, opencv-python, plotly.
+
+## Architecture
+
+**MapReader.py** — Main Marimo notebook (reactive cell-based execution). Each `@app.cell` is an independent unit:
+
+1. **Dependency management** — Auto-installs missing packages, imports core libraries
+2. **Random sampling & preview** — `get_random_sample_tiffs()` walks `geotiffs/` dirs, `downsample_tiff()` reduces resolution for display (handles multi-band, dtype normalization to uint8)
+3. **Visual previews** — Renders downsampled images from each category using `mo.hstack`
+4. **Geospatial audit** — `audit_geotiff_collection()` extracts metadata (dims, bands, CRS, dtype) into a Polars DataFrame
+5. **Interactive mapping** — `create_individual_maps_with_images()` transforms CRS to WGS84 (EPSG:4326), overlays rasters on Leafmap basemaps via base64-encoded PNG
+6. **Plotly gallery** — Subplot grid of samples with pan/zoom
+7. **Graticule extraction** — Canny edge detection + HoughLinesP + histogram peak detection to find grid lines (max 100 divisions)
+8. **OCR text detection** — EasyOCR for English and Simplified Chinese, classifies detected text blocks by type (character/number/symbol/mixed)
+
+**main.py** — Lightweight Marimo script that lists GeoTIFF files by directory category.
+
+## Data Layout
+
+GeoTIFF data lives in `geotiffs/` (git-ignored). Three collections:
+- `7900/` — Spanish topographic maps (collarless), with `.tif`, `.tfw`, `.prj` files
+- `8450/` — Mixed GeoTIFF assortment
+- `ru_cn_topos/` — Russian language topographic maps of China, includes `.ovr` and `.aux.xml` metadata
+
+In the future, these could be any number of subdirectories.
+
+`dumbtiffs/` (also git-ignored) holds non-georeferenced TIFFs for comparison.
+
+## Key Patterns
+
+- Image processing pipeline: load via rasterio → downsample → extract RGB bands → normalize to uint8 → convert to PIL Image
+- CRS handling: always check for missing CRS before geospatial operations; use `rasterio.warp.transform_bounds` for WGS84 conversion
+- Marimo cells return variables via tuple to make them available to other cells
+- Error handling uses try-except with silent fallback for optional dependencies and per-file errors during batch operations
+
+## Rumsey Pipeline (Target Architecture)
+
+1. Preprocessing (radiometric correction, COG tiling)
+2. Detection (deep learning text detection → binary masks)
+3. Subtraction (bitwise ops → "Text-Only" and "Features-Only" rasters)
+4. Reconstruction (neural inpainting for contour/road continuity)
+5. Vectorization (cleaned rasters → GeoJSON or H3 indexes)
+
+## Roadmap: Target Capabilities
+
+### Advanced Segmentation
+- **Segment Anything Model (SAM)** and **SegFormer** for isolating features by morphology rather than pixel value
+- **MapKurator** pipelines for detecting, transcribing, and geolocating arbitrarily oriented text (curved, vertical, interrupted labels)
+- Multi-stage masking to decouple textual layers from geometric layers (hydrography, topography, transport)
+
+### Morphological Shape Analysis
+- **Skeletonization** and **Hough Transforms** to distinguish features of identical color (e.g., closed-loop isolines vs. networked road graphs)
+- Spatial frequency filtering (Fourier transforms, Gabor filters) to separate text edges from smooth geometric curves
+- **LaMa (Large Mask Inpainting)** or GAN-based architectures to heal line features after text removal, ensuring connectivity for vectorization
+
+### Extended Tech Stack
+| Category | Tools & Libraries |
+| :--- | :--- |
+| **I/O & Processing** | `Rasterio`, `OpenCV`, `NumPy`, `GDAL` |
+| **Machine Learning** | `PyTorch`, `Detectron2`, `Segment-Geospatial (samgeo)` |
+| **Map Extraction** | `mapKurator`, `MapReader`, `Tesseract` |
+| **Vector Analysis** | `GeoPandas`, `Shapely`, `Momepy` |
+| **Environment** | `Docker`, `Jupyter`, `Lonboard` |
+
+> **Focus Area:** Context-aware extraction — training models to understand that a line following an elevation gradient is a contour while a line connecting nodes is a road, even when they share the same color.
