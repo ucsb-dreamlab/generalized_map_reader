@@ -250,7 +250,17 @@ def _(downsample_tiff, make_subplots, mo, px, tiffs_to_show):
 
 
 @app.cell
-def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_show):
+def _(
+    cv2,
+    downsample_tiff,
+    go,
+    make_subplots,
+    mo,
+    np,
+    px,
+    rasterio,
+    tiffs_to_show,
+):
     from scipy.ndimage import map_coordinates
     from scipy.signal import find_peaks
     from rasterio.warp import transform_bounds, transform
@@ -258,7 +268,7 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
 
     # --- Helper functions ---
 
-    def _detect_neatline(gray_img):
+    def detect_neatline(gray_img):
         """Find the map's inner boundary to exclude collar/margins."""
         h, w = gray_img.shape
         row_means = gray_img.mean(axis=1)
@@ -277,7 +287,7 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
         col_min, col_max = _find_edge(col_means, w)
         return row_min, row_max, col_min, col_max
 
-    def _generate_crs_candidates(path, analysis_scale):
+    def generate_crs_candidates(path, analysis_scale):
         """Generate candidate graticule lines at standard cartographic intervals."""
         try:
             with rasterio.open(path) as src:
@@ -343,7 +353,7 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
 
         return candidates if candidates else None
 
-    def _score_candidate(edge_img, neatline, meridians, parallels):
+    def score_candidate(edge_img, neatline, meridians, parallels):
         """Score how well a candidate interval matches actual image edges."""
         row_min, row_max, col_min, col_max = neatline
         h, w = edge_img.shape
@@ -376,7 +386,7 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
         coverage = min(1.0, n_lines / 4.0)
         return edge_density * coverage
 
-    def _detect_graticule_pixel_space(gray_img, edge_img, neatline):
+    def detect_graticule_pixel_space(gray_img, edge_img, neatline):
         """Fallback for ungeoreferenced TIFFs — find regular spacing via FFT."""
         row_min, row_max, col_min, col_max = neatline
         cropped = edge_img[row_min:row_max, col_min:col_max]
@@ -432,7 +442,7 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
         v_positions = [p + col_min for p in v_positions]
         return h_positions, v_positions
 
-    def _format_interval(deg):
+    def format_interval(deg):
         """Format degree value as human-readable string."""
         minutes = deg * 60
         if abs(deg - round(deg)) < 1e-6 and deg >= 1:
@@ -463,7 +473,7 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
         _edges = cv2.Canny(_gray, 50, 150, apertureSize=3)
 
         # Detect neatline
-        _neatline = _detect_neatline(_gray)
+        _neatline = detect_neatline(_gray)
 
         # Try CRS-aware path
         _method = None
@@ -473,19 +483,19 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
         _h_count = 0
         _v_count = 0
 
-        _candidates = _generate_crs_candidates(_path, _analysis_scale)
+        _candidates = generate_crs_candidates(_path, _analysis_scale)
         if _candidates:
             _best_score = 0.0
             _best = None
             for _interval, _meridians, _parallels in _candidates:
-                _s = _score_candidate(_edges, _neatline, _meridians, _parallels)
+                _s = score_candidate(_edges, _neatline, _meridians, _parallels)
                 if _s > _best_score:
                     _best_score = _s
                     _best = (_interval, _meridians, _parallels)
 
             if _best is not None and _best_score > 0.02:
                 _method = "CRS-aware"
-                _interval_str = _format_interval(_best[0])
+                _interval_str = format_interval(_best[0])
                 _line_color = "cyan"
                 # Collect curves for drawing (meridians + parallels)
                 for rows, cols in _best[1]:
@@ -497,7 +507,7 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
 
         # Pixel-space fallback
         if _method is None:
-            _h_positions, _v_positions = _detect_graticule_pixel_space(_gray, _edges, _neatline)
+            _h_positions, _v_positions = detect_graticule_pixel_space(_gray, _edges, _neatline)
             _method = "Pixel-space (FFT)"
             _line_color = "red"
             _h_count = len(_h_positions)
@@ -552,6 +562,153 @@ def _(cv2, downsample_tiff, go, make_subplots, mo, np, px, rasterio, tiffs_to_sh
         mo.md("\n\n".join(_summaries)),
         mo.ui.plotly(_grid_fig)
     ])
+    return (
+        detect_graticule_pixel_space,
+        detect_neatline,
+        format_interval,
+        generate_crs_candidates,
+        score_candidate,
+    )
+
+
+@app.cell
+def _(mo, tiffs_to_show):
+    selected_grids = mo.ui.multiselect(
+        options=list(tiffs_to_show.keys()),
+        label="Select the categories/directories with good grid extractions:",
+        value=[]
+    )
+    selected_grids
+    return (selected_grids,)
+
+
+@app.cell
+def _(
+    cv2,
+    detect_graticule_pixel_space,
+    detect_neatline,
+    downsample_tiff,
+    format_interval,
+    generate_crs_candidates,
+    go,
+    mo,
+    np,
+    os,
+    px,
+    score_candidate,
+    selected_grids,
+):
+    mo.stop(not selected_grids.value, mo.md("Please select at least one category to process all its maps."))
+
+    _batch_analysis_scale = 0.15
+    _batch_display_scale = 0.05
+    _batch_results = []
+
+    for _label in selected_grids.value:
+        _dir_path = "geotiffs" if _label == "root" else os.path.join("geotiffs", _label)
+        _tiffs = [f for f in os.listdir(_dir_path) if f.lower().endswith(('.tif', '.tiff'))]
+    
+        for _tiff in _tiffs:
+            _path = os.path.join(_dir_path, _tiff)
+        
+            # Load for analysis and display
+            _img_analysis = np.array(downsample_tiff(_path, scale_factor=_batch_analysis_scale))
+            _img_display = np.array(downsample_tiff(_path, scale_factor=_batch_display_scale))
+        
+            if len(_img_analysis.shape) == 3:
+                _gray = cv2.cvtColor(_img_analysis, cv2.COLOR_RGB2GRAY)
+            else:
+                _gray = _img_analysis
+            
+            _edges = cv2.Canny(_gray, 50, 150, apertureSize=3)
+            _neatline = detect_neatline(_gray)
+        
+            _method = None
+            _interval_str = "N/A"
+            _h_count = 0
+            _v_count = 0
+            _draw_curves = []
+            _line_color = "cyan"
+        
+            _candidates = generate_crs_candidates(_path, _batch_analysis_scale)
+            if _candidates:
+                _best_score = 0.0
+                _best = None
+                for _interval, _meridians, _parallels in _candidates:
+                    _s = score_candidate(_edges, _neatline, _meridians, _parallels)
+                    if _s > _best_score:
+                        _best_score = _s
+                        _best = (_interval, _meridians, _parallels)
+            
+                if _best is not None and _best_score > 0.02:
+                    _method = "CRS-aware"
+                    _interval_str = format_interval(_best[0])
+                    for _rows, _cols in _best[1]:
+                        _draw_curves.append((_rows, _cols))
+                        _v_count += 1
+                    for _rows, _cols in _best[2]:
+                        _draw_curves.append((_rows, _cols))
+                        _h_count += 1
+                
+            if _method is None:
+                _h_positions, _v_positions = detect_graticule_pixel_space(_gray, _edges, _neatline)
+                _method = "Pixel-space (FFT)"
+                _line_color = "red"
+                _h_count = len(_h_positions)
+                _v_count = len(_v_positions)
+            
+                _a_h, _a_w = _gray.shape
+                for _y in _h_positions:
+                    _draw_curves.append(
+                        (np.array([_y, _y], dtype=float), np.array([0, _a_w - 1], dtype=float))
+                    )
+                for _x in _v_positions:
+                    _draw_curves.append(
+                        (np.array([0, _a_h - 1], dtype=float), np.array([_x, _x], dtype=float))
+                    )
+
+            # Build summary
+            _summary_text = f"**{_tiff}** ({_label}): {_method} | {_h_count} parallels, {_v_count} meridians | Interval: {_interval_str}"
+        
+            # Build plot
+            _fig_batch = go.Figure()
+            _img_trace = px.imshow(_img_display).data[0]
+            _fig_batch.add_trace(_img_trace)
+        
+            _scale_ratio = _batch_display_scale / _batch_analysis_scale
+            _line_x = []
+            _line_y = []
+            for _rows, _cols in _draw_curves:
+                _line_x.extend((_cols * _scale_ratio).tolist() + [None])
+                _line_y.extend((_rows * _scale_ratio).tolist() + [None])
+            
+            if _line_x:
+                _fig_batch.add_trace(
+                    go.Scatter(
+                        x=_line_x, y=_line_y, mode='lines',
+                        line=dict(color=_line_color, width=2), showlegend=False
+                    )
+                )
+            
+            _fig_batch.update_layout(
+                height=350,
+                margin=dict(l=0, r=0, t=10, b=0),
+                showlegend=False
+            )
+            _fig_batch.update_xaxes(showticklabels=False)
+            _fig_batch.update_yaxes(showticklabels=False)
+
+            _batch_results.append(
+                mo.vstack([
+                    mo.md(_summary_text),
+                    mo.ui.plotly(_fig_batch)
+                ])
+            )
+
+    mo.vstack([
+        mo.md("### Batch Processing Results"),
+        mo.vstack(_batch_results)
+    ]) if _batch_results else mo
     return
 
 
